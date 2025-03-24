@@ -8,3 +8,8 @@ tornado
 transformers
 vllm
 deepspeed
+setuptools
+datasets
+wandb
+weave
+trl
