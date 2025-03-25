@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Sequence
 import weave
 import torch
+from torch import nn
 
 from trl import TrlParser
 from trl.import_utils import is_fastapi_available, is_pydantic_available, is_uvicorn_available, is_vllm_available

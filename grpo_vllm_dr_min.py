@@ -1,5 +1,5 @@
 from transformers import AutoTokenizer, AutoModelForCausalLM
-import json, os, random, time
+import json, os, random, time, atexit
 import torch
 import numpy as np
 import requests
@@ -14,6 +14,7 @@ import re
 from rich.console import Console
 from math_verify import parse, verify, ExprExtractionConfig
 
+from vllm_client import VLLMClient
 from utils import print_prompt_completions_sample
 
 console = Console()
@@ -26,12 +27,13 @@ class Args:
     """Configuration for Dr. GRPO Training with vLLM server"""
     # Model and server configuration
     model_path: str = "HuggingFaceTB/SmolLM2-135M-Instruct"
-    vllm_server: str = "http://localhost:8000"
-    device: str = "mps"  # Use 'mps' for Mac, 'cuda' for GPU, or 'cpu'
+    vllm_host: str = "localhost"
+    vllm_port: int = 8000
+    device: str = "cuda"  # Use 'mps' for Mac, 'cuda' for GPU, or 'cpu'
     
     # Training hyperparameters
     learning_rate: float = 1e-6
-    train_batch_size: int = 2
+    train_batch_size: int = 4
     num_generations: int = 8
     all_steps: int = 1000
     gen_update_steps: int = 16  # Steps between updating vLLM server weights
@@ -81,35 +83,7 @@ def reward_format(item, answer):
     )
 
 
-class VLLMClient:
-    def __init__(self, server_url):
-        self.server_url = server_url
 
-    def generate(self, prompts, n=1, temperature=0.9, top_p=1.0, max_tokens=700):
-        """Generate completions for prompts using vLLM server"""
-        request_data = {
-            "prompts": prompts,
-            "n": n,
-            "temperature": temperature,
-            "top_p": top_p,
-            "max_tokens": max_tokens,
-        }
-
-        response = requests.post(f"{self.server_url}/generate/", json=request_data)
-        return response.json()["completion_ids"]
-
-    def update_named_param(self, name, tensor_data):
-        """Update named parameter in the vLLM server"""
-        request_data = {
-            "name": name,
-            "dtype": str(tensor_data.dtype).split(".")[-1],
-            "shape": list(tensor_data.shape),
-        }
-        requests.post(f"{self.server_url}/update_named_param/", json=request_data)
-
-    def reset_prefix_cache(self):
-        """Reset the prefix cache in vLLM server"""
-        requests.post(f"{self.server_url}/reset_prefix_cache/")
 
 
 def get_per_token_logps(logits, input_ids):
@@ -252,14 +226,14 @@ def main(args: Args):
     
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
-        torch_dtype=torch.float32,  # Using float32 for Mac compatibility
+        torch_dtype=torch.bfloat16,  # Using float32 for Mac compatibility
         device_map=args.device,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
 
     # Initialize vLLM client
-    vllm_client = VLLMClient(args.vllm_server)
-
+    vllm_client = VLLMClient(args.vllm_host, args.vllm_port)
+    
     # Load dataset
     dataset = load_dataset("openai/gsm8k", "main", split="train")
     QAs = [
@@ -333,5 +307,6 @@ def main(args: Args):
 
 
 if __name__ == "__main__":
-    script_args = Args()
+    import simple_parsing as sp
+    script_args = sp.parse(Args)
     main(script_args)
