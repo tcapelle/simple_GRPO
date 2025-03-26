@@ -26,17 +26,19 @@ The reasoning process and answer are enclosed within <think> </think> and<answer
 class Args:
     """Configuration for Dr. GRPO Training with vLLM server"""
     # Model and server configuration
-    model_path: str = "HuggingFaceTB/SmolLM2-135M-Instruct"
+    model_path: str = "Qwen/Qwen2.5-1.5B"
     vllm_host: str = "localhost"
     vllm_port: int = 8000
     device: str = "cuda"  # Use 'mps' for Mac, 'cuda' for GPU, or 'cpu'
     
     # Training hyperparameters
     learning_rate: float = 1e-6
-    train_batch_size: int = 4
+    train_batch_size: int = 1
     num_generations: int = 8
     all_steps: int = 1000
-    gen_update_steps: int = 16  # Steps between updating vLLM server weights
+    gen_update_steps: int = 64  # Steps between updating vLLM server weights
+    gradient_accumulation_steps: int = 8  # Number of steps to accumulate gradients
+    effective_batch_size: int = train_batch_size * gradient_accumulation_steps  # Effective batch size
     
     # Generation parameters
     temperature: float = 0.9
@@ -155,6 +157,7 @@ def Dr_GRPO_step(batch, model, tokenizer):
     metrics = {}
     metrics["advantage_mean"] = advantages.mean().item()
     metrics["advantage_std"] = advantages.std().item()
+    metrics["loss"] = loss.item()
 
     # Calculate mean token length
     metrics["completion_length"] = completion_mask.sum(dim=1).float().mean().item()
@@ -228,8 +231,16 @@ def main(args: Args):
         args.model_path,
         torch_dtype=torch.bfloat16,  # Using float32 for Mac compatibility
         device_map=args.device,
+        attn_implementation="flash_attention_2",
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+    optimizer.zero_grad()  # Initialize gradients
+
+    # Print training configuration
+    console.print(f"[bold green]Training with:[/bold green]")
+    console.print(f"[cyan]- Batch size per step:[/cyan] {args.train_batch_size}")
+    console.print(f"[cyan]- Gradient accumulation steps:[/cyan] {args.gradient_accumulation_steps}")
+    console.print(f"[cyan]- Effective batch size:[/cyan] {args.effective_batch_size}")
 
     # Initialize vLLM client
     vllm_client = VLLMClient(args.vllm_host, args.vllm_port)
@@ -246,7 +257,10 @@ def main(args: Args):
 
     # Training loop
     progress = tqdm(range(1, args.all_steps + 1))
-    for step in progress:
+    step = 0
+    global_step = 1
+    while global_step < args.all_steps + 1:
+        step += 1
         # Sample batch and generate completions
         inputs = random.sample(QAs, args.train_batch_size)
         
@@ -262,7 +276,7 @@ def main(args: Args):
             max_tokens=args.max_tokens,
         )
 
-        print_prompt_completions_sample(prompts, completions[::args.num_generations], rewards[::args.num_generations], step)
+        print_prompt_completions_sample(prompts, completions[::args.num_generations], rewards[::args.num_generations], global_step)
 
         batch = prepare_batch(
             prompt_ids,
@@ -276,20 +290,28 @@ def main(args: Args):
         loss, metrics = Dr_GRPO_step(
             batch, model, tokenizer
         )
-        optimizer.zero_grad()
+        loss = loss / args.gradient_accumulation_steps  # Scale loss for gradient accumulation
         loss.backward()
-        optimizer.step()
-        progress.set_description(f"Loss: {loss.item():.6f}")
-
-        # Logging
-        if step % args.log_steps == 0:
+        
+        # Log metrics
+        if global_step % args.log_steps == 0:
+            metrics["loss"] = loss.item() * args.gradient_accumulation_steps  # Rescale loss for logging
             wandb.log({
-                "step": step,
+                "global_step": global_step,
                 **metrics,
             })
+            progress.set_description(f"Loss: {metrics['loss']:.6f}")
+
+        
+        # Only update weights after accumulating gradients for the specified number of steps
+        if step % args.gradient_accumulation_steps == 0:
+            optimizer.step()
+            optimizer.zero_grad()
+            progress.update(1)
+            global_step += 1
 
         # Update vLLM server weights
-        if step % args.gen_update_steps == 0:
+        if global_step % args.gen_update_steps == 0:
             print("Updating vLLM server weights...")
             state_dict = model.state_dict()
             for name, param in state_dict.items():
@@ -297,9 +319,9 @@ def main(args: Args):
             vllm_client.reset_prefix_cache()
 
         # Save model checkpoint
-        if step % args.save_steps == 0:
-            print(f"Saving model at step {step}")
-            save_name = f"{args.output_dir}/step_{step}"
+        if global_step % args.save_steps == 0:
+            print(f"Saving model at step {global_step}")
+            save_name = f"{args.output_dir}/step_{global_step}"
             model.save_pretrained(save_name)
             tokenizer.save_pretrained(save_name)
 
